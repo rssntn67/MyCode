@@ -1,0 +1,3 @@
+update alarmed_map set mapname='RM' where mapname='COMGEN-RM';
+delete from alarmed_map where mapname='ROMA';
+delete from alarmed_element where elementlabel='ROMA';
