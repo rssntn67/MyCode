@@ -1,0 +1,330 @@
+#! /bin/bash
+
+MAIL_TO="tizio@arsinfo.it"
+PSQL_HOST="db.arsinfo.it"
+PSQL_USER="opennms"
+PSQL_DB="dw"
+export PGPASSWORD="open"
+PSQL_CMD="select distinct lower(hostname),indirizzo_ip,community,version,timeout from v01.pdi_fast_asset_nodi where non_monitorare='f'"; 
+
+OPENNMS_HOME="/usr/share/opennms"
+PROVISION="$OPENNMS_HOME/bin/provision.pl --password admin"
+FOREIGN_SOURCE="ARSINFO"
+POLICY_URL=" -u admin:admin http://127.0.0.1:8980/opennms/rest/foreignSources/$FOREIGN_SOURCE/policies"
+
+FILE="/tmp/fastdata.out"
+LOG="/tmp/schedulefastalignment.log"
+PSQL_BAD_NODE="select nodeid,nodelabel,nodesysname,foreignid from node where nodesysname is not null and foreignsource='$FOREIGN_SOURCE' and strpos(lower(nodelabel), lower(nodesysname)) != 1"
+PSQL_OLD_OUTAGE="select foreignid from node n left join ipinterface i on i.nodeid = n.nodeid left join outages o \
+on n.nodeid=o.nodeid left join service s on s.serviceid = o.serviceid \
+left join category_node cn on cn.nodeid=n.nodeid \
+left join categories c on c.categoryid=cn.categoryid \
+where ifregainedservice is null and \
+iflostservice < now() - interval '2 days' and \
+isSnmpPrimary='P' and servicename = 'ICMP' \
+and categoryname='Accesso'"
+
+setSnmp() {
+   $PROVISION  snmp set $1 $2 version=$3 timeout=$4
+}
+
+deleteInterface() {
+   $PROVISION interface remove $FOREIGN_SOURCE $1 $2
+}
+
+deleteNode() {
+   $PROVISION node remove $FOREIGN_SOURCE $1
+}
+
+unmanageInterface() {
+   /usr/bin/curl -s -X DELETE -H "Content-Type: application/xml" $POLICY_URL/Manage$1 >/dev/null 2>&1
+}
+
+addInterface() {
+   $PROVISION interface add $FOREIGN_SOURCE $1 $2
+   $PROVISION interface set $FOREIGN_SOURCE $1 $2 snmp-primary "$3"
+   $PROVISION interface set $FOREIGN_SOURCE $1 $2 descr "provided by FAST schedule alignement script"
+   $PROVISION service add   $FOREIGN_SOURCE $1 $2 ICMP
+   $PROVISION service add   $FOREIGN_SOURCE $1 $2 SNMP
+}
+
+manageInterface() {
+   /usr/bin/curl -s -X POST -H "Content-Type: application/xml" \
+-d "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<policy xmlns=\"http://xmlns.opennms.org/xsd/config/foreign-source\" \
+class=\"org.opennms.netmgt.provision.persist.policies.MatchingIpInterfacePolicy\" \
+name=\"Manage$1\"> <parameter value=\"MANAGE\" key=\"action\"/>\
+<parameter value=\"ALL_PARAMETERS\" key=\"matchBehavior\"/>
+<parameter value=\"~^$1$\" key=\"ipAddress\"/>\
+</policy>" $POLICY_URL >/dev/null 2>&1
+}
+
+deleteOpenNMSOutagedNodes() {
+   /usr/bin/psql -t -A -F: -U $PSQL_USER -h opennmsdb -c "$PSQL_OLD_OUTAGE" | while read onmsline
+   do isInFast=`/bin/grep -i "$onmsline" $FILE | wc -l`
+      if [ $isInFast -eq 0 ]
+      then
+          foreignid=`echo $onmsline | cut -d':' -f1 | sed -e "s/ //g"`
+          echo INFO-0: deleting node: $onmsline >> $LOG
+          deleteNode $foreignid
+      fi
+   done
+}
+
+checkOpenNMSNodes() {
+   /usr/bin/psql -t -A -F: -U $PSQL_USER -h opennmsdb -c "$PSQL_BAD_NODE" | while read onmsline
+   do echo ERROR-0: found mismatched nodelabel vs sysname node: $onmsline >> $LOG
+   done
+}
+
+removeWrongFastNodes() {
+if [ -f $FILE.good ]
+then 
+   rm $FILE.good
+fi
+while read line
+do foreignid=`echo $line | cut -d':' -f1 | sed -e "s/ //g"`
+   fast_ip=`echo $line | cut -d':' -f2 | sed -e "s/ //g"`
+   community=`echo $line | cut -d':' -f3 | sed -e "s/ //g"`
+   version=`echo $line | cut -d':' -f4 | sed -e "s/ //g"`
+   timeout=`echo $line | cut -d':' -f5 | sed -e "s/ //g"`
+
+   if [ "x$fast_ip" == "x" -a "x$foreignid" == "x" ]
+   then
+        continue
+   fi
+
+   if [ "x$foreignid" == "x" ]
+   then
+        /usr/bin/psql -t -A -U $PSQL_USER -h opennmsdb -c "select n.nodeid,nodelabel,foreignid from node n left join ipinterface i on n.nodeid = i.nodeid where ipaddr = '$fast_ip'" | while read opn; do
+        echo ERROR-1: $line foreign id is blanck. $fast_ip found on $opn >> $LOG
+        done
+        continue
+   fi
+
+   if [ "x$fast_ip" == "x" ]
+   then
+        echo ERROR-2: $line ip address is blank, foreignid $foreignid found on: `/usr/bin/psql -t -A -U $PSQL_USER -h opennmsdb -c "select n.nodeid,nodelabel,nodesysoid from node n where foreignid = '$foreignid'" ` >> $LOG
+        continue
+   fi
+
+   if [ "x$community" == "x" -o  "x$version" == "x" -o  "x$timeout" == "x" ]
+   then
+        echo ERROR-3: $line snmp data is wrong, foreignid $foreignid found on: `/usr/bin/psql -t -A -U $PSQL_USER -h opennmsdb -c "select n.nodeid,nodelabel,nodesysoid from node n where foreignid = '$foreignid'" ` >> $LOG
+        /usr/bin/psql -t -A -U $PSQL_USER -h opennmsdb -c "select n.nodeid,nodelabel from node n left join ipinterface i on n.nodeid = i.nodeid where ipaddr = '$fast_ip'" | while read opn; do
+        echo ERROR-3: $line snmp data is wrong . $fast_ip found on $opn >> $LOG
+        done
+        continue
+   fi
+
+   count=`/usr/bin/psql -t -A -U $PSQL_USER -h opennmsdb -c "select count(*) from node n where foreignid = '$foreignid'"`
+
+   if [ $count -eq 0 ]
+   then
+        /usr/bin/psql -t -A -U $PSQL_USER -h opennmsdb -c "select n.nodeid,nodelabel,foreignid from node n left join ipinterface i on n.nodeid = i.nodeid where ipaddr = '$fast_ip'" | while read opn; do
+        echo ERROR-4: $line foreign id or nodelabel not found. $fast_ip found on $opn >> $LOG
+        done
+        continue
+   fi
+
+   accesso=`/usr/bin/psql -t -A -U $PSQL_USER -h opennmsdb -c "select count(*) from node n left join category_node cn on cn.nodeid = n.nodeid left join categories c on c.categoryid = cn.categoryid where categoryname='Accesso' and  foreignid = '$foreignid'"`
+
+   if [ $accesso -eq 0 ]
+   then
+        echo ERROR-5: $line  node $foreignid not found in Accesso >> $LOG
+        continue
+   fi
+
+   hassnmp=`/usr/bin/psql -t -A -U $PSQL_USER -h opennmsdb -c "select count(*) from node n where foreignid =  '$foreignid' and  nodesysoid is not null"`
+   
+   if [ $hassnmp -eq 1 ]
+   then 
+      nooutage=`/usr/bin/psql -t -A -U $PSQL_USER -h opennmsdb -c "select count(*) from outages o left join ipinterface i on i.nodeid = o.nodeid left join node n on n.nodeid=o.nodeid left join service s on s.serviceid = o.serviceid where ifregainedservice is null and iflostservice < now() - interval '2 days' and isSnmpPrimary='P' and servicename = 'SNMP' and foreignid =  '$foreignid' "`
+       if [ $nooutage -eq 0 ]
+       then
+           checkfastip=`/usr/bin/psql -t -A -U $PSQL_USER -h opennmsdb -c "select count(*) from ipinterface i left join node n on n.nodeid = i.nodeid where ipaddr = '$fast_ip' and foreignid =  '$foreignid'"`
+           if [ $checkfastip -eq 0 ]
+           then 
+               echo ERROR-99: $line $fast_ip not found on legacy node `/usr/bin/psql -t -A -U $PSQL_USER -h opennmsdb -c "select n.nodeid,nodelabel,nodesysoid from node n where foreignid = '$foreignid'"`  >> $LOG
+               /usr/bin/psql -t -A -U $PSQL_USER -h opennmsdb -c "select n.nodeid,nodelabel,foreignid from node n left join ipinterface i on n.nodeid = i.nodeid where ipaddr = '$fast_ip'" | while read opn; do
+        echo ERROR-99: $line $fast_ip not found on legacy node $foreignid, found on $opn >> $LOG
+        done
+        continue
+          fi
+       fi
+   fi   
+   echo $line >> $FILE.good
+done < $FILE
+}
+
+checkFastSingleIp() {
+while read line
+do foreignid=`echo $line | cut -d':' -f1 | sed -e "s/ //g"`
+   found=`/bin/grep "$foreignid:" $FILE.good.multihomed | wc -l`
+   if [ $found -gt 0 ]
+   then
+      continue
+   fi 
+   fast_ip=`echo $line | cut -d':' -f2 | sed -e "s/ //g"`
+   community=`echo $line | cut -d':' -f3 | sed -e "s/ //g"`
+   version=`echo $line | cut -d':' -f4 | sed -e "s/ //g"`
+   timeout=`echo $line | cut -d':' -f5 | sed -e "s/ //g"`
+   ipline=`/usr/bin/psql -t -A -F: -U $PSQL_USER -h opennmsdb -c \
+   "select isSnmpPrimary,isManaged from node n left join ipinterface i \
+    on n.nodeid = i.nodeid where foreignid = '$foreignid' and ipaddr = '$fast_ip'"`
+   isSnmpPrimary=`echo $ipline | cut -d':' -f1 | sed -e "s/ //g"`
+   isManaged=`echo $ipline | cut -d':' -f2 | sed -e "s/ //g"`
+   if [ "P" == "$isSnmpPrimary" -a "M" == "$isManaged" ]
+   then continue
+   fi
+
+   if [ "S" == "$isSnmpPrimary" -o "N" == "$isSnmpPrimary" ]
+   then
+      nooutageonprimary=`/usr/bin/psql -t -A -U $PSQL_USER -h opennmsdb -c \
+         "select count(*) from outages o left join ipinterface i on i.nodeid = o.nodeid \
+          left join node n on n.nodeid=o.nodeid left join service s on s.serviceid = o.serviceid \
+          where ifregainedservice is null and iflostservice < now() - interval '2 days' \
+          and servicename = 'SNMP' and  foreignid=  '$foreignid' and isSnmpPrimary='P'"`
+      if [ $nooutageonprimary -eq 0 ]
+      then echo WARN: $line: is isSnmpPrimary \'$isSnmpPrimary\': no outage found on node...holding >> $LOG
+
+         if [ "M" ==  "$isManaged" ]
+         then continue
+         elif [ "$isManaged" == "U" ]
+         then
+           echo INFO-3: $line is unmanaged $isManaged: manage   >> $LOG
+           setSnmp $fast_ip $community $version $timeout
+           manageInterface $fast_ip
+           continue
+         elif [ "$isManaged" == "F" ]
+         then
+           echo INFO-3: $line is force unmanaged $isManaged: manage   >> $LOG
+           setSnmp $fast_ip $community $version $timeout
+           manageInterface $fast_ip
+         else
+           echo ERROR-777: $line  has isManaged=$isManaged  >> $LOG
+           continue
+         fi
+     fi
+   fi
+   echo INFO-1: $line: not found primary ip $fast_ip: manage and add primary >> $LOG
+   setSnmp $fast_ip $community $version $timeout
+   manageInterface $fast_ip
+   addInterface $foreignid $fast_ip "P"
+   /usr/bin/psql -t -A -U $PSQL_USER -h opennmsdb -c "select ipaddr from node n left join ipinterface i on n.nodeid = i.nodeid where foreignid = '$foreignid' and ipaddr != '$fast_ip' and ismanaged='M'" | while read opennms_ip; do
+      echo INFO-2: $line: opennms managed ip $opennms_ip: unmanage and delete >> $LOG
+      unmanageInterface $opennms_ip
+      deleteInterface $foreignid $opennms_ip
+   done
+done <$FILE.good
+}
+
+foundFastMultiIpNode() {
+if [ -f $FILE.good.multihomed.temp ]
+then
+   rm $FILE.good.multihomed.temp
+fi
+oldforeignid=""
+while read line
+do foreignid=`echo $line | cut -d':' -f1 | sed -e "s/ //g"`
+   if [ "x$foreignid" == "x$oldforeignid" ]
+   then 
+      echo "$foreignid:" >> $FILE.good.multihomed.temp
+   fi
+   oldforeignid="$foreignid"
+done <$FILE.good
+/usr/bin/sort -u $FILE.good.multihomed.temp > $FILE.good.multihomed
+}
+
+checkFastMultiIp() {
+   while read mforeignid
+   do if [ -f $FILE.removedprimary ]
+      then rm $FILE.removedprimary
+      fi
+      foreignid=`echo $mforeignid | sed -e "s/://g"`
+      /usr/bin/psql -t -A -F: -U $PSQL_USER -h opennmsdb -c \
+              "select ipaddr,isSnmpPrimary from node n left join ipinterface i on n.nodeid = i.nodeid where foreignid = '$foreignid' and ismanaged='M'"| \
+      while read nms_line
+      do opennms_ip=`echo $nms_line | cut -d':' -f1 | sed -e "s/ //g"`
+         opennms_is=`echo $nms_line | cut -d':' -f2 | sed -e "s/ //g"`
+         found=`/bin/grep "$mforeignid$opennms_ip:" $FILE.good | wc -l`
+         if [ $found -eq 0 -a "x$opennms_is" == "xP" ]
+         then 
+              nooutage=`/usr/bin/psql -t -A -U $PSQL_USER -h opennmsdb -c \
+         "select count(*) from outages o left join ipinterface i on i.nodeid = o.nodeid \
+          left join node n on n.nodeid=o.nodeid left join service s on s.serviceid = o.serviceid \
+          where ifregainedservice is null and iflostservice < now() - interval '2 days' \
+          and servicename = 'SNMP' and i.ipaddr =  '$opennms_ip' "`
+              if [ $nooutage -eq 0 ]
+              then 
+                   echo WARN: $foreignid multihomed onms_ip $opennms_ip is primary: no outage found...holding >> $LOG
+              else
+                   echo INFO-2: $foreignid multihomed onms_ip $opennms_ip is primary: outage found: unmanage and delete >> $LOG
+                   unmanageInterface $opennms_ip
+                   deleteInterface $foreignid $opennms_ip
+                   echo remove > $FILE.removedprimary
+              fi
+         elif [ $found -eq 0 -a "x$opennms_is" == "xS" ]
+         then echo INFO-2: $foreignid multihomed onms_ip $opennms_ip is secondary: unmanage and delete >> $LOG
+              unmanageInterface $opennms_ip
+              deleteInterface $foreignid $opennms_ip
+         elif  [ $found -eq 0 ]
+         then echo INFO-4: $foreignid multihomed onms_ip $opennms_ip: unmanage  >> $LOG
+              unmanageInterface $opennms_ip
+         fi
+      done 
+      /bin/grep $mforeignid $FILE.good | while read line
+      do foreignid=`echo $line | cut -d':' -f1 | sed -e "s/ //g"`
+         fast_ip=`echo $line | cut -d':' -f2 | sed -e "s/ //g"`
+         community=`echo $line | cut -d':' -f3 | sed -e "s/ //g"`
+         version=`echo $line | cut -d':' -f4 | sed -e "s/ //g"`
+         timeout=`echo $line | cut -d':' -f5 | sed -e "s/ //g"`
+         if [ -f $FILE.removedprimary -a "$community" != "public" ]
+         then echo INFO-1: $line must be primary: manage and add primary >> $LOG
+             setSnmp $fast_ip $community $version $timeout
+             manageInterface $fast_ip
+             addInterface $foreignid $fast_ip "P"
+             rm $FILE.removedprimary
+             continue
+         fi
+         isManaged=`/usr/bin/psql -t -A -U $PSQL_USER -h opennmsdb -c "select isManaged from node n left join ipinterface i on n.nodeid = i.nodeid where foreignid = '$foreignid' and ipaddr = '$fast_ip'"`
+         if [ "$isManaged" == "M" ]
+         then continue
+         elif [ "$isManaged" == "" ]
+         then
+           echo INFO-5: $line is not in database $isManaged: manage and add secondary    >> $LOG
+           setSnmp $fast_ip $community $version $timeout
+           manageInterface $fast_ip
+           addInterface $foreignid $fast_ip "S"
+         elif [ "$isManaged" == "U" ]
+         then
+           echo INFO-3: $line is unmanaged $isManaged: manage   >> $LOG
+           setSnmp $fast_ip $community $version $timeout
+           manageInterface $fast_ip
+         elif [ "$isManaged" == "F" ]
+         then
+           echo INFO-3: $line is force unmanaged $isManaged: manage   >> $LOG
+           setSnmp $fast_ip $community $version $timeout
+           manageInterface $fast_ip
+         else
+           echo ERROR-777: $line  has isManaged=$isManaged  >> $LOG
+         fi 
+      done 
+   done <$FILE.good.multihomed
+}
+
+if [ -f $LOG ]
+then
+  rm $LOG
+fi
+checkOpenNMSNodes
+/usr/bin/psql -t -F: -A -U $PSQL_USER -h $PSQL_HOST -d $PSQL_DB -c "$PSQL_CMD" | /usr/bin/sort > $FILE 
+deleteOpenNMSOutagedNodes
+removeWrongFastNodes
+foundFastMultiIpNode
+checkFastSingleIp
+checkFastMultiIp
+echo DEBUG: found `/usr/bin/wc -l $FILE` in FAST database  >> $LOG
+echo DEBUG: found `/usr/bin/wc -l $FILE.good` in FAST/OpenNMS database  >> $LOG
+echo DEBUG: found `/usr/bin/wc -l $FILE.good.multihomed` multihomed in FAST database  >> $LOG
+/usr/bin/mail -s "$0: `date`" $MAIL_TO < $LOG

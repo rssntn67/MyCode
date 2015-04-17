@@ -1,0 +1,13 @@
+#!/bin/bash
+
+OPENNMS_HOME='/usr/share/opennms'
+
+/usr/bin/psql -U opennms -h opennmsdb -t -c "select n.nodeid from node n left join category_node cn on n.nodeid=cn.nodeid left join categories c on c.categoryid=cn.categoryid where categoryname = 'Core' AND foreignsource='ARSINFO' order by n.nodeid" | /bin/sed -e "s/ //g" | while read nodeid 
+do 
+if [ "$nodeid" == "" ]
+then
+ continue
+else
+$OPENNMS_HOME/bin/send-event.pl -n $nodeid -p 'configSource opennms' -p 'configUser arusso' uei.opennms.org/internal/translator/entityConfigChanged
+fi
+done

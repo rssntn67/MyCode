@@ -1,0 +1,14 @@
+#! /usr/bin/perl
+# usage: nullrancid [-V] hostname
+#
+use Getopt::Std;
+getopts('V');
+if ($opt_V) {
+    print "nullrancid 2.3.6\n";
+    exit(0);
+}
+$host = $ARGV[0];
+
+open(OUTPUT,">$host.new") || die "Can't open $host.new for writing: $!\n";
+print OUTPUT "No supported configuration Download for this device\n";
+close(OUTPUT);

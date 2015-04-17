@@ -1,0 +1,120 @@
+#! /bin/bash
+RANCID_HOME="/var/lib/rancid"
+DEBUG=0
+HOST=""
+WGET="/usr/bin/wget -q -t 1"
+PASS=""
+METHOD=""
+
+show_help () {
+        /bin/cat <<END
+
+Usage: $0 -dV <host>
+
+END
+        exit 1
+}
+
+manage_wget_error() {
+  wget_exit_code=$1
+  wget_error_message=""
+
+  case "$wget_exit_code" in 
+      
+       "1") wget_error_message="wget $HOST: Generic error code." 
+            ;;
+
+       "2")  wget_error_message="wget $HOST: Parse error--for instance, when parsing command-line options, the `.wgetrc' or `.netrc'..." 
+            ;;
+
+       "3")  wget_error_message="wget $HOST: File I/O error." 
+            ;;
+
+       "4")  wget_error_message="wget $HOST: Network failure."
+            ;;
+
+       "5")  wget_error_message="wget $HOST: SSL verification failure."
+            ;;
+
+       "6")  wget_error_message="wget $HOST: Username/password authentication failure."
+            ;;
+
+       "7")  wget_error_message="wget $HOST: Protocol errors."
+            ;;
+
+       "8")  wget_error_message="wget $HOST: Server issued an error response."
+            ;;
+
+    esac
+    echo $wget_error_message
+    exit 1
+}
+
+show_version() {
+   echo  "rancid 2.3.6"
+   exit 1
+}
+
+if [ "${1}" == "" ] ; then
+   show_help
+fi
+
+while [ "${1}" != "" ] ; do
+
+   case "${1}" in
+
+           "-d") WGET="/usr/bin/wget -d -t 1"
+                 DEBUG=1
+                 shift 1
+                 ;;
+
+           "-V") show_version
+                 ;;
+
+           *) HOST="$1"
+              shift 1
+                 ;;
+
+    esac
+done
+
+if [ "$HOST" == "" ]; then
+echo "Too few arguments: host name required"
+exit
+fi
+
+METHOD=`/bin/grep "$HOST" $RANCID_HOME/.cloginrc | grep method | /usr/bin/awk {'print $4'}` 
+
+if [ "$METHOD" == "http" ]; then
+PASS=`/bin/grep "$HOST" $RANCID_HOME/.cloginrc | grep password | /usr/bin/awk {'print $4'}` 
+$WGET -O /dev/null -q http://$HOST/processlogin.cgi?loginPassword=$PASS
+wget_exit_code=$?
+if [ $wget_exit_code -gt 0 ]; then
+   manage_wget_error $wget_exit_code 
+fi
+$WGET -O $HOST.rawconfig http://$HOST/backupsettings.conf 
+$WGET -O /dev/null -q http://$HOST/login.cgi?logout=0 
+else
+echo $METHOD not supported. Only http is supported
+exit 1
+fi
+
+if [ -s $HOST.rawconfig ]; then
+count=`wc -l $HOST.rawconfig | /usr/bin/awk {'print $1'}` 
+if [ $count -gt 20 ]; then
+echo "!RANCID-CONTENT-TYPE: 3comwireless" > $HOST.new
+echo "!" >> $HOST.new
+echo "!" >> $HOST.new
+echo "!" >> $HOST.new
+echo "!" >> $HOST.new
+echo "!" >> $HOST.new
+/bin/cat $HOST.rawconfig >> $HOST.new
+else
+echo "$HOST: Authentication Failure"
+fi
+else
+echo "$HOST: Error Downloaded Configuration is wrong"
+fi
+if [ $DEBUG -eq 0 ]; then
+/bin/rm $HOST.rawconfig
+fi

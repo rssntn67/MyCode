@@ -1,0 +1,9 @@
+#!/bin/bash
+OPENNMS_HOME='/usr/share/opennms'
+
+/usr/bin/wget -q -O - http://arusso:pass@opennmsrancid.arsinfo.it/cgi-bin/checkRancidOldScheduled.cgi |awk -F: {'print $5'} | while read nodeid
+do if [ "x$nodeid" != "x" ]
+   then 
+$OPENNMS_HOME/bin/send-event.pl -n $nodeid -p 'configSource opennms' -p 'configUser arusso' uei.opennms.org/internal/translator/entityConfigChanged
+   fi
+done 

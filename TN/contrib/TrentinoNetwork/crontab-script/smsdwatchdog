@@ -1,0 +1,32 @@
+#!/bin/bash
+SMSDLOGFILE="/var/log/smstools/smsd.log"
+PROG="WATCHDOG"
+
+timeouts0=`grep 'timeout occurred.' $SMSDLOGFILE | wc -l`
+atv1badcommands0=`grep 'ATV1 bad command!!!' $SMSDLOGFILE | wc -l`
+date0=`/bin/date +"%Y-%m-%d %H:%M:%S,0,"`
+echo "$date0 $PROG: timeouts: $timeouts0" >> $SMSDLOGFILE
+echo "$date0 $PROG: atv1badcommands: $atv1badcommands0" >> $SMSDLOGFILE
+/bin/sleep 70s 
+timeouts1=`grep 'timeout occurred.' $SMSDLOGFILE | wc -l`
+atv1badcommands1=`grep 'ATV1 bad command!!!' $SMSDLOGFILE | wc -l`
+date0=`/bin/date +"%Y-%m-%d %H:%M:%S,0,"`
+echo "$date0 $PROG: timeouts: $timeouts1" >> $SMSDLOGFILE
+echo "$date0 $PROG: atv1badcommands: $atv1badcommands1" >> $SMSDLOGFILE
+if [ $timeouts1 -gt $timeouts0 -a $atv1badcommands1 -ge $atv1badcommands0 ]
+then
+/bin/sleep 90s 
+timeouts=`grep 'timeout occurred.' $SMSDLOGFILE | wc -l`
+atv1badcommands=`grep 'ATV1 bad command!!!' $SMSDLOGFILE | wc -l`
+date0=`/bin/date +"%Y-%m-%d %H:%M:%S,0,"`
+echo "$date0 $PROG: timeouts: $timeouts" >> $SMSDLOGFILE
+echo "$date0 $PROG: atv1badcommands: $atv1badcommands" >> $SMSDLOGFILE
+if [ $timeouts -gt $timeouts1 -a $atv1badcommands -ge $atv1badcommands1 ]
+then
+date0=`/bin/date +"%Y-%m-%d %H:%M:%S,0,"`
+echo "$date0 $PROG: restarting smsd" >> $SMSDLOGFILE
+     mv /var/spool/sms/failed/* /var/spool/sms/outgoing/
+     /etc/init.d/smstools restart
+echo "$date0 $PROG: smsd restarted." >> $SMSDLOGFILE
+fi
+fi

@@ -1,0 +1,47 @@
+#!/bin/bash
+ITEMMESSAGES=100
+ITEM=0
+
+RUNFILE='/var/run/opennms-cron/lastrun'
+NODEFILE='/var/run/opennms-cron/nodes'
+
+OPENNMS_HOME='/usr/share/opennms'
+
+if [ ! -f $NODEFILE ]
+then
+/usr/bin/psql -U opennms -h opennmsdb -t -c "select distinct n.nodeid from node n  left join category_node cn on n.nodeid=cn.nodeid left join categories c on c.categoryid=cn.categoryid where ( categoryname = 'Accesso' OR categoryName = 'AccessPoint' OR categoryName = 'Ponte5p4' OR categoryName = 'PontePDH' OR categoryName = 'SwitchWiNet' OR categoryName = 'Fiemme2013' OR categoryName='Universiade2013')  AND foreignsource='ARSINFO' order by n.nodeid DESC" | /bin/sed -e "s/ //g" > $NODEFILE
+fi
+
+if [ -f $RUNFILE ]
+then
+ITEM=`/bin/sed 1q $RUNFILE| /bin/sed -e "s/ //g"`
+fi
+
+ITEM=`expr $ITEM + 1`
+
+echo $ITEM > $RUNFILE
+
+LINETOOUT=`expr $ITEM \* $ITEMMESSAGES`
+LINEFILE=`/usr/bin/wc -l $NODEFILE | /usr/bin/cut -f 1 -d " "`
+if [ $LINETOOUT -gt $LINEFILE ] 
+then
+    ITEM=`expr $ITEM - 1`
+    LINETOOUT=`expr $ITEM \* $ITEMMESSAGES`
+    ITEMMESSAGES=`expr $LINEFILE - $LINETOOUT`
+    LINETOOUT=$LINEFILE
+fi
+#echo ITEM=$ITEM
+#echo LINEOUT=$LINETOOUT
+#echo ITEMMESSAGES=$ITEMMESSAGES
+#echo LINEFILE=$LINEFILE
+/usr/bin/head -n $LINETOOUT $NODEFILE | /usr/bin/tail -n $ITEMMESSAGES | while read nodeid 
+do 
+if [ "$nodeid" == "" ]
+then
+ /bin/rm $NODEFILE
+ /bin/rm $RUNFILE
+ #echo finished 1>&2
+else
+$OPENNMS_HOME/bin/send-event.pl -n $nodeid -p 'configSource opennms' -p 'configUser arusso' uei.opennms.org/internal/translator/entityConfigChanged
+fi
+done
